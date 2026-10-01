@@ -24,8 +24,9 @@ the process down is tried once more, in case something else did, and skipped
 after the second time.
 
 --collect turns a directory of finished searches into the tables the block
-benchmark reads: rpa_tuned_<tag>.json and splash_tuned_<tag>.json next to this
-file, and this device's section of flywheel_tpu/tuned_configs.json.
+benchmark reads: rpa_tuned_<tag>.json, splash_tuned_<tag>.json and
+batched_rpa_tuned_<tag>.json next to this file, and this device's section of
+flywheel_tpu/tuned_configs.json.
 """
 
 from __future__ import annotations
@@ -40,6 +41,8 @@ import statistics
 import sys
 import time
 
+from benchmarks.common.batched_rpa import FIELDS as BATCHED_RPA_FIELDS
+from benchmarks.common.batched_rpa import load_batched_rpa
 from benchmarks.common.rpa import (DEFAULT_RPA_SOURCE, RPA_V3_GIT_SHA,
                                    load_rpa_v3, vllm_page_size)
 from benchmarks.common.rpa import FIELDS as RPA_FIELDS
@@ -238,7 +241,7 @@ class Splash:
         return (lambda state: (call(q, k, v), state)), (lambda: None)
 
 
-# ---- RPA v3 -----------------------------------------------------------------
+# ---- RPA v3 and batched RPA -------------------------------------------------
 
 class Rpa:
     fields = RPA_FIELDS
@@ -249,7 +252,7 @@ class Rpa:
         self.cell = cell
         self.rpa = load_rpa_v3(args.rpa_source)
         self.table = args.rpa_table
-        self.page_size = vllm_page_size(cell.seq, cell.batch)
+        self.page_size = args.page_size or vllm_page_size(cell.seq, cell.batch)
         self.pages_per_seq = -(-cell.seq // self.page_size)
 
     def axes(self):
@@ -327,7 +330,95 @@ class Rpa:
         return (lambda state: call(*qkv, state)), fresh
 
 
-SEARCHERS = {"flywheel": Flywheel, "splash": Splash, "rpa": Rpa}
+class BatchedRpa(Rpa):
+    fields = BATCHED_RPA_FIELDS
+    size_fields = BATCHED_RPA_FIELDS
+
+    def __init__(self, cell, args):
+        self.cell = cell
+        self.wrapper, self.configs, self.tuned_params = load_batched_rpa(
+            args.rpa_source)
+        self.table = args.batched_rpa_table
+        self.page_size = args.page_size or vllm_page_size(cell.seq, cell.batch)
+        self.pages_per_seq = -(-cell.seq // self.page_size)
+        self.kv_layout = self.configs.KVLayout.HEAD_ALONG_SUBLANE
+
+    def axes(self):
+        seq, page = self.cell.seq, self.page_size
+        # Note: bkv_sz 128 aborts the compiler and a single buffer hangs the
+        # kernel at run time on v7x, so neither is a candidate.
+        return {
+            "bq_sz": [v for v in (128, 256, 512) if v <= seq],
+            "bq_c_sz": (32, 64, 128, 256),
+            "bkv_sz": [v for v in (256, 512, 1024, 2048)
+                       if v <= seq and v % page == 0],
+            "batch_size": (1,),
+            "n_buffer": (2, 3),
+        }
+
+    def seeds(self):
+        import jax.numpy as jnp
+        from jax.experimental.pallas import tpu as pltpu
+
+        cell, configs = self.cell, self.configs
+        calculated = self.tuned_params.get_tuned_params(
+            configs.ModelConfigs(
+                num_q_heads=cell.heads, num_kv_heads=cell.heads_k,
+                head_dim=cell.head_dim,
+                sm_scale=1.0 / math.sqrt(cell.head_dim),
+                mask_value=float(jnp.finfo(jnp.bfloat16).min)),
+            configs.ServingConfigs(
+                num_seqs=cell.batch,
+                num_page_indices=cell.batch * self.pages_per_seq,
+                total_q_tokens=cell.batch * cell.seq, dtype_q=jnp.bfloat16,
+                dtype_kv=jnp.bfloat16, dtype_out=jnp.bfloat16,
+                page_size=self.page_size, kv_layout=self.kv_layout),
+            vmem_limit_bytes=pltpu.get_tpu_info().vmem_capacity_bytes,
+            case="prefill")
+        seeds = [{name: getattr(calculated, name)
+                  for name in BATCHED_RPA_FIELDS}]
+        # Note: its calculated sizes do not compile for every cell, so two
+        # sizes known to run stand in as further seeds.
+        for blocks in ((256, 64, 1024, 1, 2), (128, 64, 256, 1, 2)):
+            seeds.append(dict(zip(BATCHED_RPA_FIELDS, blocks)))
+        if self.table is not None:
+            tuned = table_entry(self.table, cell, per_mask=False)
+            if tuned is not None:
+                seeds.insert(0, tuned)
+        return [seed for seed in seeds if seed["n_buffer"] > 1]
+
+    def normalize(self, config, changed):
+        config = dict(config)
+        config["bq_c_sz"] = snap(config["bq_c_sz"], self.axes()["bq_c_sz"],
+                                 config["bq_sz"])
+        return config
+
+    def build(self, config, qkv):
+        import jax
+        import jax.numpy as jnp
+
+        cell, wrapper = self.cell, self.wrapper
+        cache_shape = wrapper.get_kv_cache_shape(
+            cell.batch * self.pages_per_seq, self.page_size, cell.heads_k,
+            cell.head_dim, jnp.bfloat16, kv_layout=self.kv_layout)
+        fresh, metadata = self.cache_and_metadata(cache_shape)
+        blocks = self.configs.BlockSizes(
+            **{name: int(config[name]) for name in BATCHED_RPA_FIELDS})
+        kernel = getattr(wrapper.ragged_paged_attention, "__wrapped__",
+                         wrapper.ragged_paged_attention)
+        scale = 1.0 / math.sqrt(cell.head_dim)
+        kv_layout = self.kv_layout
+
+        def run(q, k, v, cache):
+            return kernel(q, k, v, cache, *metadata, sm_scale=scale,
+                          prefill_block_sizes=blocks, kv_layout=kv_layout)
+
+        call = jax.jit(run, donate_argnums=(3,))
+        return (lambda state: call(*qkv, state)), fresh
+
+
+SEARCHERS = {"flywheel": Flywheel, "splash": Splash, "rpa": Rpa,
+             "batched_rpa": BatchedRpa}
 
 
 # ---- the search -------------------------------------------------------------
@@ -554,6 +645,7 @@ def search(cell, args):
                         "seq": cell.seq},
                "fields": list(searcher.fields), "config": config, "ms": ms,
                "candidates": len(log.results),
+               "page_size": getattr(searcher, "page_size", None),
                "seeds": [{"config": r["config"], "status": r["status"],
                           "ms": r.get("ms")} for r in seed_ms],
                "device": jax.devices()[0].device_kind})
@@ -614,12 +706,23 @@ def collect(directory, tag):
     written = []
     for impl, order_name, extra, per_mask in (
             ("rpa", "block_order", {"rpa_git_sha": RPA_V3_GIT_SHA}, False),
+            ("batched_rpa", "block_order", {"rpa_git_sha": RPA_V3_GIT_SHA},
+             False),
             ("splash", "config_order", {"splash_git_sha": SPLASH_GIT_SHA},
              True)):
         if not by_impl[impl]:
             continue
         header = {"device": device, "dtype": "bfloat16", **extra,
                   order_name: by_impl[impl][0]["fields"]}
+        pages = {str(record["cell"]["seq"]): record["page_size"]
+                 for record in by_impl[impl]
+                 if record.get("page_size") not in (None, vllm_page_size(
+                     record["cell"]["seq"], record["cell"]["batch"]))}
+        if pages:
+            # The cells searched on a KV page size other than vLLM's default;
+            # attention_block.py runs them with --page-size.
+            header["page_size"] = dict(
+                sorted(pages.items(), key=lambda item: int(item[0])))
         path = HERE / f"{impl}_tuned_{tag}.json"
         path.write_text(dump_table(header, head_tables(by_impl[impl]),
                                    per_mask))
@@ -659,6 +762,9 @@ def main(argv=None):
     parser.add_argument("--output", type=pathlib.Path,
                         help="directory of the search logs, one per cell")
     parser.add_argument("--passes", type=int, default=3)
+    parser.add_argument("--page-size", type=int,
+                        help="KV page size for rpa and batched_rpa instead of "
+                             "vLLM's default for the sequence length")
     parser.add_argument("--candidate-timeout", type=int, default=300,
                         help="seconds before a candidate is killed as hung")
     parser.add_argument("--force", action="store_true",
@@ -666,6 +772,8 @@ def main(argv=None):
     parser.add_argument("--rpa-table", type=pathlib.Path, default=RPA_TABLE)
     parser.add_argument("--splash-table", type=pathlib.Path,
                         default=SPLASH_TABLE)
+    parser.add_argument("--batched-rpa-table", type=pathlib.Path,
+                        help="an earlier batched RPA table to seed from")
     parser.add_argument("--rpa-source", type=pathlib.Path,
                         default=DEFAULT_RPA_SOURCE)
     parser.add_argument("--splash-source", type=pathlib.Path,

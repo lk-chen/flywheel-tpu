@@ -17,6 +17,9 @@ projection are all inside the clock:
             -> splash attention
   rpa       einsum -> (batch * seq, heads, head_dim) -> ragged_paged_attention,
             which also writes the paged KV cache
+  batched_rpa  the same inputs and paged cache -> tpu-inference's experimental
+            batched RPA kernel, which also builds its tile schedule in a
+            second Pallas kernel
 
 Each projection is one einsum against a (d_model, heads, head_dim) weight that
 emits the shape its kernel takes, as vLLM's attention layer projects, so any
@@ -27,12 +30,13 @@ device time of that same executable into the qkv projection, layout, the
 attention kernel and the output projection. The kernel segment is the
 kernel-level number (kernel_tflops); the wall clock is the block-level one.
 
-Block sizes come from each impl's table for the chip the cell runs on: splash
-and RPA from splash_tuned_<chip>.json and rpa_tuned_<chip>.json next to this
-file (v6e or v7x; tune_blocks.py searches them), flywheel from flywheel_tpu's
-own lookup. A cell its table does not hold runs the impl's own default: RPA's
-formula or Tokamax's heuristic. A cell already recorded as ok in --output is
-skipped unless --trace is given.
+Block sizes come from each impl's table for the chip the cell runs on:
+splash, RPA and batched RPA from splash_tuned_<chip>.json, rpa_tuned_<chip>.json
+and batched_rpa_tuned_<chip>.json next to this file (v6e or v7x; tune_blocks.py
+searches them), flywheel from flywheel_tpu's own lookup. A cell its table does
+not hold runs the impl's own default: RPA's formula, Tokamax's heuristic,
+batched RPA's VMEM-budget calculation. A cell already recorded as ok in
+--output is skipped unless --trace is given.
 """
 
 from __future__ import annotations
@@ -46,6 +50,8 @@ import sys
 
 import numpy as np
 
+from benchmarks.common.batched_rpa import FIELDS as BATCHED_RPA_FIELDS
+from benchmarks.common.batched_rpa import load_batched_rpa
 from benchmarks.common.records import recorded, write_record
 from benchmarks.common.rpa import DEFAULT_RPA_SOURCE, load_rpa_v3, vllm_page_size
 from benchmarks.common.rpa import FIELDS as RPA_FIELDS
@@ -63,7 +69,7 @@ SPLASH_TABLE = pathlib.Path(__file__).with_name("splash_tuned_v6e.json")
 # device_kind -> the suffix of the tables searched on that chip; any other
 # chip reads the v6e tables.
 TABLE_TAGS = {"TPU7x": "v7x"}
-IMPLS = ("flywheel", "splash", "rpa")
+IMPLS = ("flywheel", "splash", "rpa", "batched_rpa")
 TRACE_CALLS = 3
 
 
@@ -115,6 +121,14 @@ def table_entry(path, cell, per_mask):
         return None
     order = table.get("config_order") or table["block_order"]
     return dict(zip(order, values))
+
+
+def table_page_size(path, cell):
+    """The KV page size the table searched this sequence length on, or None
+    for vLLM's default."""
+    if path is None or not path.exists():
+        return None
+    return json.loads(path.read_text()).get("page_size", {}).get(str(cell.seq))
 
 
 def make_weights(cell):
@@ -229,7 +243,7 @@ def build_rpa(cell, w, args):
 
     rpa = load_rpa_v3(args.rpa_source)
     total = cell.batch * cell.seq
-    page_size = vllm_page_size(cell.seq, cell.batch)
+    page_size = args.page_size or vllm_page_size(cell.seq, cell.batch)
     pages_per_seq = -(-cell.seq // page_size)
     num_pages = cell.batch * pages_per_seq
     cache_shape = rpa.get_kv_cache_shape(num_pages, page_size, cell.heads_k,
@@ -284,8 +298,90 @@ def build_rpa(cell, w, args):
             (lambda: jnp.zeros(cache_shape, jnp.bfloat16)), info)
 
 
+def build_batched_rpa(cell, w, args):
+    """(step, fresh_state, info) for the experimental batched RPA kernel."""
+    import jax
+    import jax.numpy as jnp
+    from jax.experimental.pallas import tpu as pltpu
+
+    wrapper, configs, tuned_params = load_batched_rpa(args.rpa_source)
+    if not cell.causal:
+        raise ValueError("batched RPA only supports causal attention.")
+    total = cell.batch * cell.seq
+    # Note: on v7x the kernel halts the core on the 16-token pages vLLM uses
+    # past 8192 tokens, so its table records the page size of those cells.
+    page_size = (args.page_size
+                 or table_page_size(args.batched_rpa_table, cell)
+                 or vllm_page_size(cell.seq, cell.batch))
+    pages_per_seq = -(-cell.seq // page_size)
+    num_pages = cell.batch * pages_per_seq
+    # Note: the layout tpu-inference runs unless USE_BATCHED_RPA_SEQ_ON_LANE is
+    # set; SEQ_ALONG_LANE only supports a page size of 128.
+    layout = configs.KVLayout.HEAD_ALONG_SUBLANE
+    cache_shape = wrapper.get_kv_cache_shape(
+        num_pages, page_size, cell.heads_k, cell.head_dim, jnp.bfloat16,
+        kv_layout=layout)
+    metadata = (
+        jnp.full((cell.batch,), cell.seq, jnp.int32),
+        jnp.arange(num_pages, dtype=jnp.int32),
+        jnp.arange(cell.batch + 1, dtype=jnp.int32) * cell.seq,
+        jnp.asarray(np.array([0, 0, cell.batch], np.int32)),
+    )
+    scale = 1.0 / math.sqrt(cell.head_dim)
+
+    # Note: without a table entry these are the block sizes the wrapper would
+    # pick on its own, resolved here so the record holds what ran.
+    source = "calculated"
+    blocks = tuned_params.get_tuned_params(
+        configs.ModelConfigs(
+            num_q_heads=cell.heads, num_kv_heads=cell.heads_k,
+            head_dim=cell.head_dim, sm_scale=scale,
+            mask_value=float(jnp.finfo(jnp.bfloat16).min)),
+        configs.ServingConfigs(
+            num_seqs=cell.batch, num_page_indices=num_pages,
+            total_q_tokens=total, dtype_q=jnp.bfloat16, dtype_kv=jnp.bfloat16,
+            dtype_out=jnp.bfloat16, page_size=page_size, kv_layout=layout),
+        vmem_limit_bytes=pltpu.get_tpu_info().vmem_capacity_bytes,
+        case="prefill")
+    tuned = table_entry(args.batched_rpa_table, cell, per_mask=False)
+    if tuned is not None:
+        blocks = configs.BlockSizes(
+            **{name: int(tuned[name]) for name in BATCHED_RPA_FIELDS})
+        source = "table"
+
+    kernel = getattr(wrapper.ragged_paged_attention, "__wrapped__",
+                     wrapper.ragged_paged_attention)
+
+    def block(x, wq, wk, wv, wo, cache):
+        with jax.named_scope("qkv_proj"):
+            q = jnp.einsum("btd,dnh->btnh", x, wq).reshape(
+                total, cell.heads, cell.head_dim)
+            k = jnp.einsum("btd,dnh->btnh", x, wk).reshape(
+                total, cell.heads_k, cell.head_dim)
+            v = jnp.einsum("btd,dnh->btnh", x, wv).reshape(
+                total, cell.heads_k, cell.head_dim)
+        with jax.named_scope("attn"):
+            out, cache = kernel(q, k, v, cache, *metadata, sm_scale=scale,
+                                prefill_block_sizes=blocks, kv_layout=layout)
+        with jax.named_scope("out_proj"):
+            out = jnp.einsum(
+                "btnh,nhd->btd",
+                out.reshape(cell.batch, cell.seq, cell.heads, cell.head_dim),
+                wo)
+        return out, cache
+
+    # The call donates the cache, so every timing run starts from a fresh one.
+    call = jax.jit(block, donate_argnums=(5,))
+    operands = (w["x"], w["wq"], w["wk"], w["wv"], w["wo"])
+    info = {"block_source": source,
+            "blocks": [getattr(blocks, name) for name in BATCHED_RPA_FIELDS],
+            "page_size": page_size, "kv_layout": str(layout)}
+    return ((lambda state: call(*operands, state)),
+            (lambda: jnp.zeros(cache_shape, jnp.bfloat16)), info)
+
+
 BUILDERS = {"flywheel": build_flywheel, "splash": build_splash,
-            "rpa": build_rpa}
+            "rpa": build_rpa, "batched_rpa": build_batched_rpa}
 
 
 def trace_cell(cell, step, state, directory):
@@ -359,7 +455,7 @@ def main(argv=None):
     if jax.default_backend() != "tpu":
         raise RuntimeError(f"requires TPU; got {jax.default_backend()!r}.")
     device_kind = jax.devices()[0].device_kind
-    for impl in ("rpa", "splash"):
+    for impl in ("rpa", "splash", "batched_rpa"):
         if getattr(args, f"{impl}_table") is None:
             setattr(args, f"{impl}_table", tuned_table(impl, device_kind))
 
@@ -398,8 +494,12 @@ def parse_args(argv=None):
                         help="default: rpa_tuned_<chip>.json next to this "
                              "file; a missing file selects RPA's formula")
     parser.add_argument("--splash-table", type=pathlib.Path,
-                        help="default: splash_tuned_<chip>.json next to this "
-                             "file; a missing file selects the heuristic")
+                        help="default: splash_tuned_<chip>.json")
+    parser.add_argument("--batched-rpa-table", type=pathlib.Path,
+                        help="default: batched_rpa_tuned_<chip>.json")
+    parser.add_argument("--page-size", type=int,
+                        help="KV page size for rpa and batched_rpa instead of "
+                             "vLLM's default for the sequence length")
     parser.add_argument("--rpa-source", type=pathlib.Path,
                         default=DEFAULT_RPA_SOURCE)
     parser.add_argument("--splash-source", type=pathlib.Path,
